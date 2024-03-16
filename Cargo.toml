@@ -12,3 +12,4 @@ nix = { version = "0.28.0", features = ["signal"] }
 notify-rust = "4.10.0"
 rev_buf_reader = "0.3.0"
 rodio = "0.17.3"
+sysinfo = "0.30.7"

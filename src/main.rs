@@ -2,8 +2,10 @@ use std::{
     fs::File, env, os::unix::net::{UnixStream, UnixListener},
     io::{Write, Read, BufReader, BufRead, SeekFrom, Seek, self, ErrorKind}, path::Path,
     net::{TcpStream, TcpListener},
-    time::{Duration, SystemTime, UNIX_EPOCH}
+    time::{Duration, SystemTime, UNIX_EPOCH}, 
 };
+
+use sysinfo::{Pid, Signal, System};
 use notify_rust::{Notification, Timeout};
 
 use clap::{Parser, Subcommand};
@@ -64,14 +66,13 @@ pub fn as_time(seconds: u64) -> String{
 
     return format!("{}:{}",left_minutes, left_seconds);
 }
+
 fn main() {
     let command = Cli::parse(); 
-    let socket_path = "/tmp/daemon.sock";
+    let socket_path = "/tmp/comodoro.sock";
     let state_path = "/tmp/state.sock";
-    let report_state_path = "/tmp/repst.sock";
     let daemon_stdout = "/tmp/comodoro.out";
     let daemon_stderr = "/tmp/comodoro.err";
-    let feedback_size = 4;
 
     match command.state {
         State::Pause => {
@@ -140,11 +141,6 @@ fn main() {
                 std::fs::remove_file(state_path).unwrap();
                 println!("state file removed!");
             }
-            if Path::new(report_state_path).exists() {
-                println!("Report state file already exist, trying to removing it...");
-                std::fs::remove_file(report_state_path).unwrap();
-                println!("Report state file removed!");
-            }
 
             let stdout = File::create(daemon_stdout).unwrap();
             let stderr = File::create(daemon_stderr).unwrap();
@@ -171,7 +167,6 @@ fn main() {
             let socket_stream = UnixListener::bind(socket_path).unwrap();
             let state_stream = UnixListener::bind(state_path).unwrap();
 
-            let mut state_buffer = String::new();
             state_stream.set_nonblocking(true).unwrap();
 
             for stream in socket_stream.incoming() {
@@ -187,6 +182,18 @@ fn main() {
 
                         stream.read(&mut _kill_buffer).unwrap_or(0 as usize);
                         if _kill_buffer == KILL {
+                            let s = System::new_all();
+
+                            let mut f = File::open(daemon_pid).unwrap();
+                            let mut pid = String::new();
+                            f.read_to_string(&mut pid);
+                            if !pid.is_empty() {
+                                println!("pid: {}", pid);
+                            }
+
+                            for process in s.processes_by_name("comodoro") {
+                                process.kill();
+                            }
                             return;
                         }
 
@@ -341,7 +348,6 @@ fn main() {
         State::Kill => {
             let mut stream = UnixStream::connect(socket_path).unwrap();
             stream.write_all(&KILL).unwrap();
-            // TODO: This should kill all comodoro daemons/instances
         },
     }
 }
