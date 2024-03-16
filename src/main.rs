@@ -1,12 +1,14 @@
 use std::{
     fs::File, env, os::unix::net::{UnixStream, UnixListener},
-    io::{Write, Read}, path::Path,
+    io::{Write, Read, BufReader, BufRead, SeekFrom, Seek, self, ErrorKind}, path::Path,
+    net::{TcpStream, TcpListener},
     time::{Duration, SystemTime, UNIX_EPOCH}
 };
 use notify_rust::{Notification, Timeout};
 
 use clap::{Parser, Subcommand};
 use daemonize::Daemonize;
+use rev_buf_reader::RevBufReader;
 
 const DEFAULT: [u8;1] = [0];
 const PAUSE: [u8;1] = [1];
@@ -47,11 +49,29 @@ pub enum State {
     From,
 }
 
+pub fn as_time(seconds: u64) -> String{
+    let left_minutes = if seconds / 60 < 10 {
+        format!("0{}", seconds / 60)
+    }else {
+        format!("{}", seconds/60)
+    };
+
+    let left_seconds = if seconds % 60 < 10 {
+        format!("0{}", seconds % 60)
+    }else {
+        format!("{}", seconds % 60)
+    };
+
+    return format!("{}:{}",left_minutes, left_seconds);
+}
 fn main() {
     let command = Cli::parse(); 
     let socket_path = "/tmp/daemon.sock";
     let state_path = "/tmp/state.sock";
     let report_state_path = "/tmp/repst.sock";
+    let daemon_stdout = "/tmp/comodoro.out";
+    let daemon_stderr = "/tmp/comodoro.err";
+    let feedback_size = 4;
 
     match command.state {
         State::Pause => {
@@ -82,44 +102,33 @@ fn main() {
             state_stream.write_all(&RESUME).unwrap();
         },
         State::Status => {
-            let repst = UnixListener::bind(report_state_path).unwrap();
-            repst.set_nonblocking(true).unwrap();
+            const MAX:u8 = 200;
+            let mut i:u8 = 0;
 
-            // checks for data, if exist it shows it, else do nothing
-            for stream in repst.incoming() {
+            let mut thing = TcpListener::bind("127.0.0.1:8080").unwrap();
+            thing.set_nonblocking(true).unwrap();
+
+            for stream in thing.incoming() {
                 match stream {
                     Ok(mut stream) => {
-                        let mut _kill_buffer = [0];
-                        let mut _focus_buffer = [0; 8];
-                        let mut _rest_buffer = [0; 8];
-                        let mut _elapsed_buffer = [0; 8];
-                        let mut _number_buffer = [0];
-
-                        stream.read(&mut _kill_buffer).unwrap_or(0 as usize);
-                        stream.read(&mut _focus_buffer).unwrap_or(0 as usize);
-                        stream.read(&mut _rest_buffer).unwrap_or(0 as usize);
-                        stream.read(&mut _number_buffer).unwrap_or(0 as usize);
-                        stream.read(&mut _elapsed_buffer).unwrap_or(0 as usize);
-
-                        let focus = u64::from_be_bytes(_focus_buffer);
-                        let rest = u64::from_be_bytes(_rest_buffer);
-                        let elapsed = u64::from_be_bytes(_elapsed_buffer);
-                        let number = u8::from_be_bytes(_number_buffer);
-
-                        println!("focus: {:#?}", focus);
-                        println!("rest: {:#?}", rest);
-                        println!("number: {:#?}", number);
-                        println!("elapsed: {:#?}", elapsed);
+                        let mut body = String::new();
+                        stream.read_to_string(&mut body).unwrap();
+                        println!("{}", body);
                         break;
                     }
-                    Err(_) => {
-                        println!("Nothing to show for now!");
-                        break;
+                    Err(e) => {
+                        i+=1;
                     }
+                }
+                if i == MAX {
+                    println!("No pomodoro is running!");
+                    break;
                 }
             }
         },
         State::From => todo!(),
+        // TODO: check if daemon is already running
+        // TODO: check for necessery file
         State::Init => {
             if Path::new(socket_path).exists() {
                 println!("Socket file already exist, trying to removing it...");
@@ -137,8 +146,9 @@ fn main() {
                 println!("Report state file removed!");
             }
 
-            let stdout = File::create("/tmp/daemon.out").unwrap();
-            let stderr = File::create("/tmp/daemon.err").unwrap();
+            let stdout = File::create(daemon_stdout).unwrap();
+            let stderr = File::create(daemon_stderr).unwrap();
+
             let daemonize = Daemonize::new()
                 .chown_pid_file(true)      
                 .working_directory(env::current_dir().unwrap())
@@ -160,6 +170,8 @@ fn main() {
             let mut on_focusing_ = false;
             let socket_stream = UnixListener::bind(socket_path).unwrap();
             let state_stream = UnixListener::bind(state_path).unwrap();
+
+            let mut state_buffer = String::new();
             state_stream.set_nonblocking(true).unwrap();
 
             for stream in socket_stream.incoming() {
@@ -189,18 +201,6 @@ fn main() {
                         let number = u8::from_be_bytes(_number_buffer);
                         let duty_duration =focus.wrapping_add(rest);
 
-                        let mut repost = UnixStream::connect(report_state_path).unwrap();
-                        repost.write_all(&DEFAULT).unwrap();
-                        repost.write_all(&_focus_buffer).unwrap();
-                        repost.write_all(&_rest_buffer).unwrap();
-                        repost.write_all(&_elapsed_buffer).unwrap();
-                        repost.write_all(&_number_buffer).unwrap();
-
-                        println!("focus: {:#?}", focus);
-                        println!("rest: {:#?}", rest);
-                        println!("number: {:#?}", number);
-                        println!("elapsed: {:#?}", elapsed);
-
                         let mut now = SystemTime::now();
                         let mut since_the_epoch = now.duration_since(UNIX_EPOCH)
                             .expect("Time went backwards");
@@ -210,15 +210,14 @@ fn main() {
                         let mut _now = SystemTime::now();
                         let mut __now = SystemTime::now();
 
-                        let mut diff = now_in_secs - elapsed;
-                        let mut n = diff / duty_duration;
+                        let mut time_since_started = now_in_secs - elapsed;
+                        let mut n = time_since_started / duty_duration;
 
                         while n < number as u64 {
                             // what am I trying to calculate
                             // 1) did we finished our duty?
                             // 2) what is the current countdown time?
                             // 3) on what state are we (focusing vs rest)
-
 
                             for action_buffer in state_stream.incoming() {
                                 match action_buffer {
@@ -230,7 +229,7 @@ fn main() {
                                         if action == PAUSE {
                                             _now = SystemTime::now();
                                             pausing = true;
-                                            println!("pause recivedd")
+                                            println!("pause recived");
                                         }else if action == RESUME {
                                             __now = SystemTime::now();
                                             paused_duration = paused_duration
@@ -249,16 +248,41 @@ fn main() {
                                 }
                             }
 
+                            let t = time_since_started % duty_duration;
+                            let focusing = focus.checked_sub(t).unwrap_or(0) > 0;
+                            let focusing_duration = if focusing {
+                                t
+                            }else {
+                                0
+                            };
+                            let rest_duration= t.checked_sub(focus).unwrap_or(0);
+
                             if pausing {
+                                if let Ok(mut stream) = TcpStream::connect("127.0.0.1:8080") {
+                                    println!("Connected to the server!");
+                                    stream.write_all(
+                                        format!("stateus: Pause\r\niteration: {}/{}\r\nfocus: {}/{}\r\nrest: {}/{}\r\n",
+                                                number, n,
+                                                as_time(focusing_duration), as_time(focus),
+                                                as_time(rest_duration), as_time(rest)).as_bytes()).unwrap();
+                                }
+
                                 continue;
                             } else if stopping{
                                 break;
                             }
 
-                            let t = diff % duty_duration;
-                            let focusing = focus.checked_sub(t).unwrap_or(0) > 0;
 
                             if focusing {
+                                if let Ok(mut stream) = TcpStream::connect("127.0.0.1:8080") {
+                                    println!("Connected to the server!");
+                                    stream.write_all(
+                                        format!("stateus: focusing\r\niteration: {}/{}\r\nfocus: {}/{}\r\nrest: {}/{}\r\n",
+                                                number, n,
+                                                as_time(focusing_duration), as_time(focus),
+                                                as_time(rest_duration), as_time(rest)).as_bytes()).unwrap();
+                                }
+
                                 on_focusing = true;
 
                                 if on_focusing != on_focusing_ {
@@ -271,6 +295,15 @@ fn main() {
                                 }
                                 on_focusing_ = true;
                             } else {
+                                if let Ok(mut stream) = TcpStream::connect("127.0.0.1:8080") {
+                                    println!("Connected to the server!");
+                                    stream.write_all(
+                                        format!("stateus: resting\r\niteration: {}/{}\r\nfocus: {}/{}\r\nrest: {}/{}\r\n",
+                                                number, n,
+                                                as_time(focusing_duration), as_time(focus),
+                                                as_time(rest_duration), as_time(rest)).as_bytes()).unwrap();
+                                }
+
                                 on_focusing = false;
 
                                 if on_focusing != on_focusing_ {
@@ -289,8 +322,8 @@ fn main() {
                                 .expect("Time went backwards");
                             now_in_secs = since_the_epoch.as_secs();
 
-                            diff = now_in_secs - elapsed - paused_duration;
-                            n = diff / duty_duration;
+                            time_since_started = now_in_secs - elapsed - paused_duration;
+                            n = time_since_started / duty_duration;
                         }
                         Notification::new()
                             .summary("comodoro:pomodoro")
@@ -298,6 +331,7 @@ fn main() {
                             .appname("comodoro")
                             .timeout(Timeout::from(Duration::from_secs(2)))
                             .show().unwrap();
+                        println!("done!");
                     },
                     Err(_) => {
                     },
@@ -307,6 +341,7 @@ fn main() {
         State::Kill => {
             let mut stream = UnixStream::connect(socket_path).unwrap();
             stream.write_all(&KILL).unwrap();
+            // TODO: This should kill all comodoro daemons/instances
         },
     }
 }
