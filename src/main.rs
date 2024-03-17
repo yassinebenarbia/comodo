@@ -1,16 +1,18 @@
 use std::{
-    fs::File, env, os::unix::net::{UnixStream, UnixListener},
+    fs::{File, self}, env, os::unix::net::{UnixStream, UnixListener},
     io::{Write, Read, BufReader, BufRead, SeekFrom, Seek, self, ErrorKind}, path::Path,
     net::{TcpStream, TcpListener},
-    time::{Duration, SystemTime, UNIX_EPOCH}, 
+    time::{Duration, SystemTime, UNIX_EPOCH}, thread, 
 };
 
+use config::{Comodoro, Config};
 use sysinfo::{Pid, Signal, System};
 use notify_rust::{Notification, Timeout};
 
 use clap::{Parser, Subcommand};
 use daemonize::Daemonize;
 use rev_buf_reader::RevBufReader;
+mod config;
 
 const DEFAULT: [u8;1] = [0];
 const PAUSE: [u8;1] = [1];
@@ -44,6 +46,9 @@ pub enum State {
         #[arg(short, long, default_value_t = 1)]
         /// Number of cycles
         number: u8,
+        #[arg(short, long)]
+        /// Path for the config file
+        config: String
     },
     Stop,
     Resume,
@@ -79,7 +84,20 @@ fn main() {
             let mut stream = UnixStream::connect(state_path).unwrap();
             stream.write_all(&PAUSE).unwrap();
         },
-        State::Start { focus, rest, number } => {
+        State::Start { focus, rest, number, config } => {
+            let cconfig = if !config.is_empty() {
+                let content = fs::read_to_string(config).unwrap();
+                let config: Config = toml::de::from_str(content.as_str()).unwrap();
+                config.comodoro
+            }else {
+                Comodoro {
+                    iterations: number,
+                    focus: Duration::from_secs(focus),
+                    rest: Duration::from_secs(rest),
+                    big_rest: Duration::from_secs(900)
+                }
+            };
+
             let mut stream = UnixStream::connect(socket_path).unwrap();
             UnixStream::connect(state_path).unwrap();
 
@@ -89,9 +107,9 @@ fn main() {
             let in_ms = since_the_epoch.as_secs();
 
             stream.write_all(&DEFAULT).unwrap();
-            stream.write_all(&focus.to_be_bytes()).unwrap();
-            stream.write_all(&rest.to_be_bytes()).unwrap();
-            stream.write_all(&number.to_be_bytes()).unwrap();
+            stream.write_all(&cconfig.focus.as_secs().to_be_bytes()).unwrap();
+            stream.write_all(&cconfig.rest.as_secs().to_be_bytes()).unwrap();
+            stream.write_all(&cconfig.iterations.to_be_bytes()).unwrap();
             stream.write_all(&in_ms.to_be_bytes()).unwrap();
         },
         State::Stop => {
@@ -103,13 +121,14 @@ fn main() {
             state_stream.write_all(&RESUME).unwrap();
         },
         State::Status => {
-            const MAX:u8 = 200;
+            const MAX:u8 = 11;
             let mut i:u8 = 0;
 
-            let mut thing = TcpListener::bind("127.0.0.1:8080").unwrap();
+            let thing = TcpListener::bind("127.0.0.1:8080").unwrap();
             thing.set_nonblocking(true).unwrap();
 
             for stream in thing.incoming() {
+                thread::sleep(Duration::from_millis(50));
                 match stream {
                     Ok(mut stream) => {
                         let mut body = String::new();
@@ -117,7 +136,7 @@ fn main() {
                         println!("{}", body);
                         break;
                     }
-                    Err(e) => {
+                    Err(_) => {
                         i+=1;
                     }
                 }
@@ -144,6 +163,11 @@ fn main() {
 
             let stdout = File::create(daemon_stdout).unwrap();
             let stderr = File::create(daemon_stderr).unwrap();
+            if let Ok(stream) = TcpStream::connect("127.0.0.1:8080") {
+                println!("Connected to the server!");
+            } else {
+                println!("Couldn't connect to server...");
+            }
 
             let daemonize = Daemonize::new()
                 .chown_pid_file(true)      
@@ -183,14 +207,6 @@ fn main() {
                         stream.read(&mut _kill_buffer).unwrap_or(0 as usize);
                         if _kill_buffer == KILL {
                             let s = System::new_all();
-
-                            let mut f = File::open(daemon_pid).unwrap();
-                            let mut pid = String::new();
-                            f.read_to_string(&mut pid);
-                            if !pid.is_empty() {
-                                println!("pid: {}", pid);
-                            }
-
                             for process in s.processes_by_name("comodoro") {
                                 process.kill();
                             }
@@ -221,6 +237,7 @@ fn main() {
                         let mut n = time_since_started / duty_duration;
 
                         while n < number as u64 {
+                            thread::sleep(Duration::from_millis(500));
                             // what am I trying to calculate
                             // 1) did we finished our duty?
                             // 2) what is the current countdown time?
@@ -266,7 +283,6 @@ fn main() {
 
                             if pausing {
                                 if let Ok(mut stream) = TcpStream::connect("127.0.0.1:8080") {
-                                    println!("Connected to the server!");
                                     stream.write_all(
                                         format!("stateus: Pause\r\niteration: {}/{}\r\nfocus: {}/{}\r\nrest: {}/{}\r\n",
                                                 number, n,
@@ -282,7 +298,6 @@ fn main() {
 
                             if focusing {
                                 if let Ok(mut stream) = TcpStream::connect("127.0.0.1:8080") {
-                                    println!("Connected to the server!");
                                     stream.write_all(
                                         format!("stateus: focusing\r\niteration: {}/{}\r\nfocus: {}/{}\r\nrest: {}/{}\r\n",
                                                 number, n,
@@ -338,7 +353,6 @@ fn main() {
                             .appname("comodoro")
                             .timeout(Timeout::from(Duration::from_secs(2)))
                             .show().unwrap();
-                        println!("done!");
                     },
                     Err(_) => {
                     },

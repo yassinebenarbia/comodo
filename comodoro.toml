@@ -1,0 +1,5 @@
+[comodoro]
+  iterations=5
+  focus='25:00'
+  rest='05:00'
+  big-rest='15:00'
