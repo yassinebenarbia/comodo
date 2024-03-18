@@ -1,16 +1,17 @@
 use std::{
     fs::{File, self}, env, os::unix::net::{UnixStream, UnixListener},
-    io::{Write, Read}, path::{Path, PathBuf},
+    io::{Write, Read, BufReader, BufRead, SeekFrom, Seek, self, ErrorKind}, path::Path,
     net::{TcpStream, TcpListener},
     time::{Duration, SystemTime, UNIX_EPOCH}, thread, 
 };
 
-use config::{Comodo, Config};
-use sysinfo::System;
+use config::{Comodoro, Config};
+use sysinfo::{Pid, Signal, System};
 use notify_rust::{Notification, Timeout};
 
 use clap::{Parser, Subcommand};
 use daemonize::Daemonize;
+use rev_buf_reader::RevBufReader;
 mod config;
 mod player;
 
@@ -19,8 +20,6 @@ const PAUSE: [u8;1] = [1];
 const RESUME: [u8;1] = [2];
 const STOP: [u8;1] = [3];
 const KILL: [u8;1] = [4];
-const OFF: [u8;1] = [0];
-const ON: [u8;1] = [1];
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -48,7 +47,7 @@ pub enum State {
         #[arg(short, long, default_value_t = 1)]
         /// Number of cycles
         number: u8,
-        #[arg(short, long, default_value_t = String::new())]
+        #[arg(short, long)]
         /// Path for the config file
         config: String
     },
@@ -76,10 +75,10 @@ pub fn as_time(seconds: u64) -> String{
 
 fn main() {
     let command = Cli::parse(); 
-    let socket_path = "/tmp/comodo.sock";
+    let socket_path = "/tmp/comodoro.sock";
     let state_path = "/tmp/state.sock";
-    let daemon_stdout = "/tmp/comodo.out";
-    let daemon_stderr = "/tmp/comodo.err";
+    let daemon_stdout = "/tmp/comodoro.out";
+    let daemon_stderr = "/tmp/comodoro.err";
 
     match command.state {
         State::Pause => {
@@ -90,9 +89,9 @@ fn main() {
             let cconfig = if !config.is_empty() {
                 let content = fs::read_to_string(config).unwrap();
                 let config: Config = toml::de::from_str(content.as_str()).unwrap();
-                config.comodo
+                config.comodoro
             }else {
-                Comodo {
+                Comodoro {
                     iterations: number,
                     focus: Duration::from_secs(focus),
                     rest: Duration::from_secs(rest),
@@ -120,42 +119,30 @@ fn main() {
             stream.write_all(&cconfig.iterations.to_be_bytes()).unwrap();
             stream.write_all(&in_ms.to_be_bytes()).unwrap();
 
-            // popup notification flag
             if cconfig.popup_notification {
-                stream.write_all(&ON).unwrap();
+                stream.write_all(&[1]).unwrap();
             }else {
-                stream.write_all(&OFF).unwrap();
+                stream.write_all(&[0]).unwrap();
             }
 
-            // audio notification flag
             if cconfig.sound_notification {
-                stream.write_all(&ON).unwrap();
+                stream.write_all(&[1]).unwrap();
             }else {
-                stream.write_all(&OFF).unwrap();
+                stream.write_all(&[0]).unwrap();
             }
-            // banners length
+
             stream.write_all(&cconfig.focus_notification_banner.len().to_be_bytes()).unwrap();
-            stream.write_all(&cconfig.rest_notification_banner.len().to_be_bytes()).unwrap();
-
-            // path length 
-            stream.write_all(
-                &cconfig.focus_audio_notification_path.clone().unwrap_or(Box::new(PathBuf::new())).to_str().unwrap().len().to_be_bytes()
-                ).unwrap();
-
-            // path length 
-            stream.write_all(
-                &cconfig.rest_audio_notification_path.clone().unwrap_or(Box::new(PathBuf::new())).to_str().unwrap().len().to_be_bytes()
-                ).unwrap();
-
             stream.write_all(&cconfig.focus_notification_banner.as_bytes()).unwrap();
-            stream.write_all(&cconfig.rest_notification_banner.as_bytes()).unwrap();
+
             stream.write_all(
-                &cconfig.focus_audio_notification_path.unwrap_or(Box::new(PathBuf::new())).to_str().unwrap().as_bytes()
+                &cconfig.focus_audio_notification_path.clone().unwrap().to_str().unwrap().len().to_be_bytes()
                 ).unwrap();
+            stream.write_all(&cconfig.focus_audio_notification_path.unwrap().to_str().unwrap().as_bytes()).unwrap();
+
             stream.write_all(
-                &cconfig.rest_audio_notification_path.unwrap_or(Box::new(PathBuf::new())).to_str().unwrap().as_bytes()
+                &cconfig.rest_audio_notification_path.clone().unwrap().to_str().unwrap().len().to_be_bytes()
                 ).unwrap();
-            stream.shutdown(std::net::Shutdown::Both).unwrap();
+            stream.write_all(&cconfig.rest_audio_notification_path.unwrap().to_str().unwrap().as_bytes()).unwrap();
         },
         State::Stop => {
             let mut state_stream = UnixStream::connect(state_path).unwrap();
@@ -245,19 +232,19 @@ fn main() {
                         let mut pausing = false;
                         let mut stopping = false;
 
-                        let mut _popup_notification_flag = OFF;
-                        let mut _sound_notification_flag = OFF;
+                        let mut _popup_notification_flag = [0];
+                        let mut _sound_notification_flag = [0];
 
-                        let mut _focus_notification_banner_size = [0;8];
-                        let mut _rest_notification_banner_size = [0;8];
+                        let mut _focus_notification_banner_size = [0];
+                        let mut _rest_notification_banner_size = [0];
 
-                        let mut _focus_notification_path_size = [0;8];
-                        let mut _rest_notification_path_size = [0;8];
+                        let mut _focus_notification_path_size = [0];
+                        let mut _rest_notification_path_size = [0];
 
                         stream.read(&mut _kill_buffer).unwrap_or(0 as usize);
                         if _kill_buffer == KILL {
                             let s = System::new_all();
-                            for process in s.processes_by_name("comodo") {
+                            for process in s.processes_by_name("comodoro") {
                                 process.kill();
                             }
                             return;
@@ -272,66 +259,70 @@ fn main() {
                         stream.read(&mut _sound_notification_flag).unwrap_or(0 as usize);
 
                         // focus banner size
-                        let focus_banner_size = if _popup_notification_flag != OFF {
+                        let focus_banner_size = if _popup_notification_flag != [0] {
                             stream.read(&mut _focus_notification_banner_size).unwrap_or(0 as usize);
-                            usize::from_be_bytes(_focus_notification_banner_size)
+                            u8::from_be_bytes(_focus_notification_banner_size)
                         }else {
                             0
                         };
 
+                        // focus banner
+                        let focus_banner = if _popup_notification_flag != [0] {
+                            let mut buffer: Vec<u8> = Vec::with_capacity(focus_banner_size as usize);
+                            stream.read(&mut buffer).unwrap_or(0 as usize);
+                            String::from_utf8(buffer).unwrap()
+                        }else {
+                            String::new()
+                        };
+
                         // rest banner size
-                        let rest_banner_size = if _popup_notification_flag != OFF {
+                        let rest_banner_size = if _popup_notification_flag == [1] {
                             stream.read(&mut _rest_notification_banner_size).unwrap_or(0 as usize);
-                            usize::from_be_bytes(_rest_notification_banner_size)
+                            u8::from_be_bytes(_rest_notification_banner_size)
                         }else {
                             0
+                        };
+
+                        // rest banner
+                        let rest_banner = if _popup_notification_flag == [1] {
+                            let mut buffer: Vec<u8> = Vec::with_capacity(rest_banner_size as usize);
+                            stream.read(&mut buffer).unwrap_or(0 as usize);
+                            String::from_utf8(buffer).unwrap()
+                        }else {
+                            String::new()
                         };
 
                         // focus path size
                         stream.read(&mut _focus_notification_path_size).unwrap_or(0 as usize);
-                        let focus_path_size = usize::from_be_bytes(_focus_notification_path_size);
-
-                        // rest path size
-                        stream.read(&mut _rest_notification_path_size).unwrap_or(0 as usize);
-                        let rest_path_size = usize::from_be_bytes(_rest_notification_path_size);
-
-                        let mut seeker = 0;
-                        let mut sequence = String::new();
-                        stream.read_to_string(&mut sequence).unwrap_or(0 as usize);
-
-                        // focus banner
-                        let focus_banner = if _popup_notification_flag != OFF {
-                            let tmp = sequence[seeker..seeker + focus_banner_size].to_string();
-                            seeker += focus_banner_size;
-                            tmp
-                        }else {
-                            String::new()
-                        };
-
-                        // rest banner
-                        let rest_banner = if _popup_notification_flag != OFF {
-                            let tmp = sequence[seeker..seeker + rest_banner_size].to_string();
-                            seeker += rest_banner_size;
-                            tmp
-                        }else {
-                            String::new()
-                        };
+                        let focus_path_size = u8::from_be_bytes(_focus_notification_path_size);
 
                         // focus path
                         let focus_path = if focus_path_size != 0 {
-                            let tmp = sequence[seeker..seeker + focus_path_size].to_string();
-                            seeker += focus_path_size;
-                            tmp
+                            let mut buffer: Vec<u8> = Vec::with_capacity(focus_path_size as usize);
+                            stream.read(&mut buffer).unwrap_or(0 as usize);
+                            String::from_utf8(buffer).unwrap()
                         } else {
                             String::new()
                         };
 
+                        // rest path size
+                        stream.read(&mut _rest_notification_path_size).unwrap_or(0 as usize);
+                        let rest_path_size = u8::from_be_bytes(_focus_notification_banner_size);
+
                         // rest path
                         let rest_path = if rest_path_size != 0 {
-                            let tmp = sequence[seeker..seeker + rest_path_size].to_string();
-                            seeker += rest_path_size;
-                            tmp
+                            let mut buffer: Vec<u8> = Vec::with_capacity(rest_path_size as usize);
+                            stream.read(&mut buffer).unwrap_or(0 as usize);
+                            String::from_utf8(buffer).unwrap()
                         } else {
+                            String::new()
+                        };
+
+                        let focus_banner = if _popup_notification_flag != [0] {
+                            let mut buffer: Vec<u8> = Vec::with_capacity(focus_banner_size as usize);
+                            stream.read(&mut buffer).unwrap_or(0 as usize);
+                            String::from_utf8(buffer).unwrap()
+                        }else {
                             String::new()
                         };
 
@@ -425,11 +416,14 @@ fn main() {
                                 on_focusing = true;
 
                                 if on_focusing != on_focusing_ {
-                                    if _popup_notification_flag != OFF {
+                                    if _popup_notification_flag != [0] {
+                                        let mut f = File::open("tmp").unwrap();
+                                        f.write(focus_banner.as_bytes());
+                                        f.write(b"thi");
                                         Notification::new()
-                                            .summary("Comodo Pomodoro")
+                                            .summary("comodoro:pomodoro")
                                             .body(&focus_banner.replace("#", &format!("{}", n+1)))
-                                            .appname("comodo")
+                                            .appname("comodoro")
                                             .timeout(Timeout::from(Duration::from_secs(2)))
                                             .show().unwrap();
                                     }
@@ -448,16 +442,16 @@ fn main() {
                                 on_focusing = false;
 
                                 if on_focusing != on_focusing_ {
-                                    if _popup_notification_flag != OFF {
+                                    if _popup_notification_flag != [0] {
                                         Notification::new()
-                                            .summary("Comodo Pomodoro")
+                                            .summary("comodoro:pomodoro")
                                             .body(&rest_banner.replace("#", &format!("{}", n + 1)))
-                                            .appname("comodo")
+                                            .appname("comodoro")
                                             .timeout(Timeout::from(Duration::from_secs(2)))
                                             .show().unwrap();
                                     }
-                                    if _sound_notification_flag != OFF {
-                                        let player = player::Player::new(&focus_path);
+                                    if _sound_notification_flag != [0] {
+                                        let player = player::Player::new(&rest_path);
                                         player.play();
                                     }
                                 }
@@ -473,15 +467,15 @@ fn main() {
                             n = time_since_started / duty_duration;
                         }
 
-                        if _popup_notification_flag != OFF {
+                        if _popup_notification_flag != [0] {
                             Notification::new()
-                                .summary("Comodo Pomodoro")
+                                .summary("comodoro:pomodoro")
                                 .body(&format!("End of Session!"))
-                                .appname("comodo")
+                                .appname("comodoro")
                                 .timeout(Timeout::from(Duration::from_secs(2)))
                                 .show().unwrap();
                         }
-                        if _sound_notification_flag != OFF {
+                        if _sound_notification_flag != [0] {
                             let player = player::Player::new(&rest_path);
                             player.play();
                         }

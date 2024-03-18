@@ -1,0 +1,17 @@
+[comodo]
+  iterations=2
+  focus='00:05'
+  rest='00:01'
+  big_rest='15:00'
+
+  # if u don't wanna see either a notification nor hear a sound or both
+  popup_notification=true
+  sound_notification=true
+
+  # the `#` character will be replaced by the current iteration number
+  focus_notification_banner='this #'
+  rest_notification_banner='is #'
+
+  # # absolute path or relative to the command execution path
+  focus_audio_notification_path='./assets/hotel-bell-ding-1-174457.mp3'
+  rest_audio_notification_path='./assets/hotel-bell-ding-1-174457.mp3'

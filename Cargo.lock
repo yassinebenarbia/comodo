@@ -467,7 +467,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "comodoro"
+name = "comodo"
 version = "0.1.0"
 dependencies = [
  "clap",
