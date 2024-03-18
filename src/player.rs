@@ -58,7 +58,7 @@ mod test{
 
     #[test]
     fn play_until_test() {
-        let path = String::from("/home/yassine/Programming/Rust/comodoro/assets/hotel-bell-ding-1-174457.mp3");
+        let path = String::from("./assets/hotel-bell-ding-1-174457.mp3");
         let player = Player::new(&path);
         player.play_until(Duration::from_secs(2));
     }
