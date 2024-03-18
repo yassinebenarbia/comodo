@@ -5,7 +5,7 @@
     utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, utils, naersk }:
+  outputs = inputs@{ self, nixpkgs, utils, naersk }:
     utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
@@ -19,7 +19,7 @@
         export PATH=${pkgs.pkg-config}/bin:$PATH
         '';
         devShell = with pkgs; mkShell {
-          buildInputs = [ pkg-config alsa-lib.dev gcc unstable.rustc ];
+          buildInputs = [ pkg-config alsa-lib.dev gcc rustc ];
         };
       });
 }
